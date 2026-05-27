@@ -9,10 +9,14 @@
 """
 Tracks @claude YouTube channel for new videos, fetches transcripts,
 and generates AI summaries using the claude CLI.
+
+seen.json entry statuses:
+  "done"               — transcript fetched and summary generated
+  "no_transcript"      — no captions available yet; retried each run
+  "marked-seen"        — bulk-skipped on first setup, no summary
 """
 
 import json
-import os
 import subprocess
 import sys
 from datetime import datetime
@@ -55,18 +59,16 @@ def save_seen(seen: dict):
     SEEN_FILE.write_text(json.dumps(seen, indent=2))
 
 
-def list_channel_videos(since_date: str | None = None) -> list[dict]:
+def list_channel_videos() -> list[dict]:
     print(f"Fetching video list from {CHANNEL_URL}...")
-    cmd = [
-        "yt-dlp",
-        "--flat-playlist",
-        "--print", "%(id)s\t%(title)s\t%(upload_date)s\t%(duration_string)s",
-        "--no-warnings",
-    ]
-    if since_date:
-        cmd += ["--dateafter", since_date]
-    cmd.append(CHANNEL_URL)
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(
+        [
+            "yt-dlp", "--flat-playlist",
+            "--print", "%(id)s\t%(title)s\t%(upload_date)s\t%(duration_string)s",
+            "--no-warnings", CHANNEL_URL,
+        ],
+        capture_output=True, text=True,
+    )
     if result.returncode != 0:
         print(f"yt-dlp error: {result.stderr}", file=sys.stderr)
         return []
@@ -87,8 +89,7 @@ def list_channel_videos(since_date: str | None = None) -> list[dict]:
 def fetch_transcript(video_id: str) -> str | None:
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
-        api = YouTubeTranscriptApi()
-        fetched = api.fetch(video_id)
+        fetched = YouTubeTranscriptApi().fetch(video_id)
         return " ".join(entry.text for entry in fetched)
     except Exception as e:
         print(f"  Transcript unavailable: {e}")
@@ -99,9 +100,7 @@ def summarize_with_claude(title: str, transcript: str) -> str:
     prompt = f"Video title: {title}\n\nTranscript:\n{transcript[:30000]}"
     result = subprocess.run(
         ["claude", "-p", SUMMARY_PROMPT + "\n\n" + prompt],
-        capture_output=True,
-        text=True,
-        timeout=120,
+        capture_output=True, text=True, timeout=120,
     )
     if result.returncode != 0:
         return f"*Summary failed: {result.stderr.strip()}*"
@@ -120,7 +119,7 @@ def get_video_date(video_id: str) -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
-def save_video_note(video: dict, transcript: str | None, summary: str):
+def save_video_note(video: dict, transcript: str, summary: str):
     date_str = video.get("upload_date", "")
     if not date_str or date_str == "NA":
         date_str = get_video_date(video["id"])
@@ -131,7 +130,7 @@ def save_video_note(video: dict, transcript: str | None, summary: str):
     filename = f"{date_str}_{video['id']}_{safe_title}.md".replace(" ", "_")
     filepath = VIDEOS_DIR / filename
 
-    content = f"""# {video['title']}
+    filepath.write_text(f"""# {video['title']}
 
 - **YouTube:** https://www.youtube.com/watch?v={video['id']}
 - **Date:** {date_str}
@@ -147,73 +146,88 @@ def save_video_note(video: dict, transcript: str | None, summary: str):
 <details>
 <summary>Full Transcript</summary>
 
-{transcript or '*No transcript available*'}
+{transcript}
 
 </details>
-"""
-    filepath.write_text(content)
+""")
     print(f"  Saved: {filepath.name}")
-    return filepath
+
+
+def process_video(video: dict, seen: dict):
+    transcript = fetch_transcript(video["id"])
+    if transcript:
+        print(f"  Transcript: {len(transcript)} chars — summarizing with Claude...")
+        summary = summarize_with_claude(video["title"], transcript)
+        VIDEOS_DIR.mkdir(exist_ok=True)
+        save_video_note(video, transcript, summary)
+        seen[video["id"]] = {
+            "title": video["title"],
+            "status": "done",
+            "processed": datetime.now().isoformat(),
+        }
+        print(f"  Status: done")
+    else:
+        seen[video["id"]] = {
+            "title": video["title"],
+            "status": "no_transcript",
+            "last_checked": datetime.now().isoformat(),
+        }
+        print(f"  Status: no_transcript (will retry next run)")
+    save_seen(seen)
 
 
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Track @claude YouTube channel")
     parser.add_argument("--limit", type=int, default=None,
-                        help="Only process the N most recent new videos (default: all)")
+                        help="Only process the N most recent new/pending videos")
     parser.add_argument("--mark-seen", action="store_true",
                         help="Mark all existing videos as seen without processing them")
-    parser.add_argument("--since", type=str, default=None,
-                        help="Only fetch videos uploaded after this date (YYYYMMDD), e.g. 20260506")
     args = parser.parse_args()
 
     VIDEOS_DIR.mkdir(exist_ok=True)
     seen = load_seen()
-
-    videos = list_channel_videos(since_date=args.since)
+    videos = list_channel_videos()
     if not videos:
         print("No videos found.")
         return
 
     if args.mark_seen:
-        count = 0
+        count = sum(1 for v in videos if v["id"] not in seen)
         for v in videos:
             if v["id"] not in seen:
-                seen[v["id"]] = {"title": v["title"], "processed": "marked-seen"}
-                count += 1
+                seen[v["id"]] = {"title": v["title"], "status": "marked-seen"}
         save_seen(seen)
-        print(f"Marked {count} videos as seen (no processing). Future runs will only pick up new videos.")
+        print(f"Marked {count} videos as seen. Future runs will only pick up new videos.")
         return
 
-    new_videos = [v for v in videos if v["id"] not in seen]
-    print(f"Found {len(videos)} total videos, {len(new_videos)} new.")
+    # Queue: brand-new videos + ones previously missing a transcript
+    pending = [
+        v for v in videos
+        if v["id"] not in seen
+        or seen[v["id"]].get("status") == "no_transcript"
+    ]
 
-    if args.limit and len(new_videos) > args.limit:
-        print(f"Limiting to {args.limit} most recent.")
-        new_videos = new_videos[:args.limit]
+    new_count = sum(1 for v in videos if v["id"] not in seen)
+    retry_count = len(pending) - new_count
+    print(f"Found {len(videos)} total | {new_count} new | {retry_count} retrying (no transcript)")
 
-    if not new_videos:
-        print("Nothing new to process.")
+    if args.limit:
+        pending = pending[:args.limit]
+
+    if not pending:
+        print("Nothing to process.")
         return
 
-    for i, video in enumerate(new_videos, 1):
-        print(f"\n[{i}/{len(new_videos)}] {video['title']}")
+    for i, video in enumerate(pending, 1):
+        status = seen.get(video["id"], {}).get("status", "new")
+        label = "retry" if status == "no_transcript" else "new"
+        print(f"\n[{i}/{len(pending)}] [{label}] {video['title']}")
+        process_video(video, seen)
 
-        transcript = fetch_transcript(video["id"])
-        if transcript:
-            print(f"  Transcript: {len(transcript)} chars — summarizing with Claude...")
-            summary = summarize_with_claude(video["title"], transcript)
-        else:
-            summary = "*No transcript available for this video.*"
-
-        save_video_note(video, transcript, summary)
-        seen[video["id"]] = {
-            "title": video["title"],
-            "processed": datetime.now().isoformat(),
-        }
-        save_seen(seen)
-
-    print(f"\nDone. Notes saved to {VIDEOS_DIR}")
+    done = sum(1 for v in seen.values() if v.get("status") == "done")
+    pending_left = sum(1 for v in seen.values() if v.get("status") == "no_transcript")
+    print(f"\nDone. {done} summarized | {pending_left} still awaiting transcripts")
 
 
 if __name__ == "__main__":
